@@ -8,7 +8,6 @@
 
 !pip install python-dotenv
 
-# -*- coding: utf-8 -*-
 import logging
 import asyncio
 import aiohttp
@@ -28,7 +27,7 @@ nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- конфигурация ----------
+#конфигурация
 load_dotenv()  # ищет .env в текущей папке
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -38,7 +37,7 @@ API_KEY = os.getenv("API_KEY")
 USER_AGREEMENT_URL = "https://github.com/yourusername/yourrepo/blob/main/user_agreement.md"
 PRIVACY_POLICY_URL = "https://github.com/yourusername/yourrepo/blob/main/privacy_policy.md"
 
-# ---------- база данных ----------
+# база данных 
 DB_PATH = "running_line_bot.db"
 
 def init_db():
@@ -120,7 +119,7 @@ def delete_user(telegram_id: int):
     conn.commit()
     conn.close()
 
-# ---------- вспомогательные функции ----------
+# вспомогательные функции
 def count_words(text: str) -> int:
     return len(text.split())
 
@@ -151,7 +150,7 @@ def parse_duration_input(text: str) -> int | None:
         return None
     return seconds
 
-# ---------- промпты для YandexGPT ----------
+# промпты для YandexGPT 
 BASE_PROMPT = """
 Твоя роль: редактор новостей на радио. Ты пишешь текст для ведущего в эфире.
 Соблюдай следующие жёсткие правила:
@@ -182,7 +181,7 @@ def build_system_prompt(params: dict) -> str:
 - Только глаголы и существительные. Нет «неожиданно», «сенсационно», «шокирующе».
 - Строгий новостной тон, как в выпуске новостей.
 """
-    else:  # entertainment
+    else:  
         style_text = """
 ### СТИЛЬ: РАЗВЛЕКАТЕЛЬНЫЙ
 - Более живая речь, допустимы короткие образные выражения (например, «резкое торможение», «звонкая пощёчина»).
@@ -203,7 +202,7 @@ def build_system_prompt(params: dict) -> str:
         max_words=max_words
     )
 
-# ---------- работа с YandexGPT ----------
+#работа с YandexGPT
 async def yandexgpt_request(messages, max_tokens=4000):
     url = "https://llm.api.cloud.yandex.net/v1/chat/completions"
     headers = {
@@ -282,7 +281,7 @@ async def get_yandexgpt_response(user_text: str, system_prompt: str, max_words: 
         else:
             return answer2 + " (текст слишком короткий, но это лучший вариант)"
 
-# ---------- расстановка ударений ----------
+# расстановка ударений
 async def put_stresses(text: str) -> str:
     prompt = f"""
 Твоя задача — расставить ударения в русских словах. Выделяй ударную гласную ЗАГЛАВНОЙ буквой.
@@ -298,7 +297,7 @@ async def put_stresses(text: str) -> str:
     response = await yandexgpt_request([{"role": "user", "content": prompt}], max_tokens=1500)
     return response if response else "Не удалось расставить ударения."
 
-# ---------- клавиатуры ----------
+#клавиатуры 
 def accept_terms_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Принять условия", callback_data="accept_terms")]])
 
@@ -377,7 +376,7 @@ def tempo_for_timekeeping_finetune_keyboard(current_tempo: int):
 def back_only_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back_to_params")]])
 
-# ---------- обработчики команд ----------
+# обработчики команд
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user(user_id)
@@ -503,7 +502,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Нет активного действия для отмены.")
 
-# ---------- обработчик callback'ов ----------
+# обработчик callback'ов 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -548,7 +547,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Нажмите /start")
         return
 
-    # ---------- настройки: навигация ----------
+    # настройки: навигация
     if data == "param_style":
         current = params.get('style', 'info')
         await query.edit_message_text("Выберите стиль речи:", reply_markup=style_keyboard(current))
@@ -586,7 +585,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=parameters_keyboard())
         return
 
-    # ---------- стиль ----------
+    #стиль 
     if data == "set_style_info":
         params['style'] = 'info'
         context.user_data['params'] = params
@@ -600,7 +599,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Выберите стиль речи:", reply_markup=style_keyboard('entertainment'))
         return
 
-    # ---------- темп (в параметрах) ----------
+    # темп (в параметрах)
     if data.startswith("tempo_preset_"):
         preset = int(data.split("_")[-1])
         params['speech_rate'] = preset
@@ -647,7 +646,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=parameters_keyboard())
         return
 
-    # ---------- выбор темпа для timekeeping ----------
+    # выбор темпа для timekeeping 
     if data.startswith("tk_tempo_preset_"):
         preset = int(data.split("_")[-1])
         context.user_data['temp_timekeeping_tempo'] = preset
@@ -694,7 +693,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-# ---------- обработчик текстовых сообщений ----------
+# обработчик текстовых сообщений 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if user_text.startswith('/'):
@@ -845,7 +844,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await progress_msg.edit_text(result_text, parse_mode="Markdown")
 
-# ---------- запуск бота ----------
+# запуск бота 
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
