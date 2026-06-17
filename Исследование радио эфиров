@@ -603,7 +603,7 @@ def main():
     print("=" * 60)
     analyze_transcripts()
     print("\n" + "=" * 60)
-    print("ВСЕ ЭТАПЫ ЗАВЕРШЕНЫ!")
+    print("ВСЕ ЭТАПЫ ЗАВЕРШЕНЫ!") 
     print("=" * 60)
 
 if __name__ == "__main__":
