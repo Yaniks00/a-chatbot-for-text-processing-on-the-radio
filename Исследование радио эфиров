@@ -1,0 +1,610 @@
+import os
+import asyncio
+import re
+import csv
+import math
+import statistics
+from collections import Counter, defaultdict
+from telethon import TelegramClient
+import numpy as np
+from scipy.signal import correlate
+from pydub import AudioSegment
+import whisper
+from tqdm import tqdm
+
+#настройки (измените под себя)
+# API-данные Telegram – получите на my.telegram.org
+API_ID = 1234567                # ваш API ID
+API_HASH = 'your_api_hash'      # ваш API Hash
+
+#ссылка на канал, откуда хотите скачать аудио файлы
+CHANNEL_USERNAME = 'channel_username'  #укажите никнейм или ссылку на канал
+
+# сколько последних сообщений сканировать
+DOWNLOAD_LIMIT = 100
+
+# базовый каталог проекта (все папки будут созданы внутри него)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  
+
+# подпапки для скачанных, обработанных файлов и расшифровок
+DOWNLOAD_FOLDER = os.path.join(BASE_DIR, "downloaded_audio")      # куда сохранять аудио из Telegram
+PROCESSED_FOLDER = os.path.join(BASE_DIR, "processed_audio")      # куда сохранять вырезанные новостные блоки
+TRANSCRIBED_FOLDER = os.path.join(BASE_DIR, "transcriptions")     # куда сохранять текстовые расшифровки
+
+# пути к звуковым сигналам начала и конца (пользователь должен указать свои файлы)
+START_SIGNAL = os.path.join(BASE_DIR, "signals", "start-signal.mp3")   # путь к файлу сигнала начала
+END_SIGNAL = os.path.join(BASE_DIR, "signals", "end-signal.mp3")       # путь к файлу сигнала конца 
+
+# параметры обработки
+MAX_NEWS_DURATION = 600           # максимальная длительность новостного блока (сек)
+MIN_NEWS_DURATION = 30            # минимальная длительность (сек) – более короткие отбрасываются
+CORRELATION_THRESHOLD = 0.5       # порог корреляции для поиска сигнала (0–1)
+SEARCH_START_WINDOW = 600         # в каких первых секундах искать стартовый сигнал
+
+# Настройки Whisper
+WHISPER_MODEL = "base"            # модель: tiny, base, small, medium, large
+WHISPER_LANGUAGE = "ru"           # язык распознавания
+
+# выходные файлы
+ANALYSIS_OUTPUT_CSV = os.path.join(BASE_DIR, "news_features.csv")   # CSV с признаками новостей
+PROMPT_OUTPUT_FILE = os.path.join(BASE_DIR, "prompt.txt")           # сгенерированный промпт
+
+# таймауты и повторы
+DOWNLOAD_TIMEOUT = 1800
+MAX_RETRIES = 3
+
+
+
+# скачивание аудио из Telegram
+async def progress_callback(current, total):
+    percent = current / total * 100
+    downloaded = current / (1024 * 1024)
+    size = total / (1024 * 1024)
+    print(f"\rПрогресс: {percent:.1f}% ({downloaded:.2f} / {size:.2f} МБ)", end="", flush=True)
+
+async def download_file(message, path):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            await message.download_media(file=path, progress_callback=progress_callback)
+            return True
+        except Exception as e:
+            print(f"\nОшибка загрузки (попытка {attempt}): {e}")
+            if attempt < MAX_RETRIES:
+                delay = attempt * 5
+                print(f"Повтор через {delay} секунд")
+                await asyncio.sleep(delay)
+                if os.path.exists(path):
+                    os.remove(path)
+    return False
+
+async def download_audio_from_telegram():
+    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+    client = TelegramClient("session_name", API_ID, API_HASH,
+                            connection_retries=10, retry_delay=5,
+                            timeout=60, request_retries=10)
+    async with client:
+        channel = await client.get_entity(CHANNEL_USERNAME)
+        print(f"Канал: {channel.title}")
+        downloaded_count = 0
+        checked_count = 0
+        async for message in client.iter_messages(channel, limit=DOWNLOAD_LIMIT):
+            checked_count += 1
+            media = None
+            media_type = None
+            if message.audio:
+                media = message.audio
+                media_type = "audio"
+            elif message.voice:
+                media = message.voice
+                media_type = "voice"
+            elif message.document:
+                mime = message.document.mime_type
+                if mime and mime.startswith("audio/"):
+                    media = message.document
+                    media_type = "document"
+                else:
+                    continue
+            else:
+                continue
+            filename = f"audio_{message.id}"
+            if hasattr(media, "attributes"):
+                for attr in media.attributes:
+                    if hasattr(attr, "title") and attr.title:
+                        filename = attr.title
+                        if hasattr(attr, "performer") and attr.performer:
+                            filename = f"{attr.performer} - {filename}"
+                        break
+            filename = (f"{filename}.mp3"
+                        .replace("/", "_")
+                        .replace("\\", "_")
+                        .replace(":", "_"))
+            filepath = os.path.join(DOWNLOAD_FOLDER, filename)
+            if os.path.exists(filepath):
+                print(f"Уже существует: {filename}")
+                continue
+            print(f"Скачивание: {filename}")
+            result = await download_file(message, filepath)
+            if result:
+                downloaded_count += 1
+                print("\nСохранено")
+            else:
+                print("\nНе удалось скачать")
+        print(f"Проверено сообщений: {checked_count}, скачано файлов: {downloaded_count}")
+
+
+# обработка аудио – вырезание по сигналам 
+def load_audio_to_array(audio_path, target_sr=22050):
+    audio = AudioSegment.from_file(audio_path)
+    audio = audio.set_channels(1).set_frame_rate(target_sr)
+    samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
+    samples = samples / (2 ** 15)
+    return samples, target_sr
+
+def find_signal_position(audio_array, signal_array, sr, threshold=0.5, max_search_sec=None):
+    audio_norm = (audio_array - np.mean(audio_array)) / (np.std(audio_array) + 1e-10)
+    signal_norm = (signal_array - np.mean(signal_array)) / (np.std(signal_array) + 1e-10)
+    if max_search_sec is not None:
+        max_samples = int(max_search_sec * sr)
+        if max_samples < len(audio_norm):
+            audio_norm = audio_norm[:max_samples]
+    correlation = correlate(audio_norm, signal_norm, mode='valid')
+    if len(correlation) == 0:
+        return None, 0.0
+    max_corr = np.max(correlation)
+    if max_corr < threshold:
+        return None, max_corr
+    peak_index = np.argmax(correlation)
+    position_sec = peak_index / sr
+    return position_sec, max_corr
+
+def process_audio_files():
+    os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+    if not os.path.exists(START_SIGNAL):
+        print(f"ОШИБКА: стартовый сигнал не найден: {START_SIGNAL}")
+        return
+    start_array, sr = load_audio_to_array(START_SIGNAL)
+    if END_SIGNAL and os.path.exists(END_SIGNAL):
+        end_array, _ = load_audio_to_array(END_SIGNAL, sr)
+    else:
+        end_array = None
+        print("Сигнал конца не задан или не найден – будет использоваться максимальная длительность.")
+    allowed_ext = ('.mp3', '.wav', '.m4a', '.flac', '.ogg')
+    files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.lower().endswith(allowed_ext)]
+    if not files:
+        print(f"В папке {DOWNLOAD_FOLDER} нет аудиофайлов!")
+        return
+    print(f"Найдено {len(files)} файлов. Ищем сигнал начала в первых {SEARCH_START_WINDOW} секундах.")
+    success_count = 0
+    for i, fname in enumerate(files, 1):
+        print(f"\n[{i}/{len(files)}] Обрабатываю: {fname}")
+        input_path = os.path.join(DOWNLOAD_FOLDER, fname)
+        try:
+            audio_array, sr_cur = load_audio_to_array(input_path, sr)
+            total_duration = len(audio_array) / sr
+            start_pos, start_corr = find_signal_position(
+                audio_array, start_array, sr,
+                threshold=CORRELATION_THRESHOLD,
+                max_search_sec=SEARCH_START_WINDOW
+            )
+            if start_pos is None:
+                print(f"  Стартовый сигнал не найден в первых {SEARCH_START_WINDOW} сек (лучшая корр={start_corr:.3f}). Пропускаем.")
+                continue
+            print(f"  Стартовый сигнал найден на {start_pos:.2f} сек (корреляция={start_corr:.3f})")
+            end_pos = None
+            if end_array is not None:
+                search_start_sec = start_pos + 10
+                search_end_sec = min(start_pos + MAX_NEWS_DURATION, total_duration)
+                if search_end_sec > search_start_sec:
+                    start_sample = int(search_start_sec * sr)
+                    end_sample = int(search_end_sec * sr)
+                    audio_slice = audio_array[start_sample:end_sample]
+                    end_pos_rel, end_corr = find_signal_position(
+                        audio_slice, end_array, sr,
+                        threshold=CORRELATION_THRESHOLD,
+                        max_search_sec=None
+                    )
+                    if end_pos_rel is not None:
+                        end_pos = search_start_sec + end_pos_rel
+                        print(f"  Конечный сигнал найден на {end_pos:.2f} сек (корр={end_corr:.3f})")
+                    else:
+                        print(f"  Конечный сигнал не найден в интервале до {search_end_sec:.1f} сек, использую max_duration={MAX_NEWS_DURATION} сек")
+                else:
+                    print(f"  Интервал для поиска конца слишком мал, использую max_duration={MAX_NEWS_DURATION} сек")
+            if end_pos is not None and end_pos > start_pos:
+                news_end = end_pos
+            else:
+                news_end = start_pos + MAX_NEWS_DURATION
+            if news_end > total_duration:
+                news_end = total_duration
+                print(f"  Конец новостей ограничен концом файла ({total_duration:.1f} сек)")
+            news_length = news_end - start_pos
+            if news_length < MIN_NEWS_DURATION:
+                print(f"  Длина новостей {news_length:.1f} сек < {MIN_NEWS_DURATION}, пропускаем.")
+                continue
+            start_ms = int(start_pos * 1000)
+            end_ms = int(news_end * 1000)
+            original_audio = AudioSegment.from_file(input_path)
+            news_segment = original_audio[start_ms:end_ms]
+            out_name = f"{os.path.splitext(fname)[0]}_news.mp3"
+            out_path = os.path.join(PROCESSED_FOLDER, out_name)
+            news_segment.export(out_path, format="mp3")
+            print(f"  Сохранено: {out_name} (длина {len(news_segment) / 1000:.1f} сек)")
+            success_count += 1
+        except Exception as e:
+            print(f"  Ошибка при обработке: {e}")
+            continue
+    print(f"\nГотово! Успешно обработано {success_count} из {len(files)} файлов.")
+    print(f"Результаты в папке: {PROCESSED_FOLDER}")
+
+
+# распознавание речи
+def transcribe_audio_files():
+    os.makedirs(TRANSCRIBED_FOLDER, exist_ok=True)
+    audio_extensions = (".mp3", ".wav", ".m4a", ".flac", ".ogg")
+    audio_files = []
+    for root, dirs, files in os.walk(PROCESSED_FOLDER):
+        for file in files:
+            if file.lower().endswith(audio_extensions):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, PROCESSED_FOLDER)
+                output_txt = os.path.join(TRANSCRIBED_FOLDER, rel_path) + ".txt"
+                if os.path.exists(output_txt):
+                    print(f"Пропускаем (уже есть): {output_txt}")
+                    continue
+                audio_files.append((full_path, output_txt))
+    if not audio_files:
+        print("Нет новых аудиофайлов для распознавания.")
+        return
+    print(f"Найдено файлов для обработки: {len(audio_files)}")
+    print(f"Загрузка модели Whisper '{WHISPER_MODEL}'...")
+    model = whisper.load_model(WHISPER_MODEL)
+    for audio_path, txt_path in tqdm(audio_files, desc="Распознавание"):
+        try:
+            os.makedirs(os.path.dirname(txt_path), exist_ok=True)
+            result = model.transcribe(audio_path, language=WHISPER_LANGUAGE, task="transcribe", verbose=False)
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(result["text"])
+        except Exception as e:
+            print(f"\nОшибка при обработке {audio_path}: {e}")
+    print("Распознавание завершено!")
+
+
+# анализ текста и генерация промпта 
+def get_sentences(text):
+    text = re.sub(r'\.{3,}', '.', text)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if len(s.strip()) > 5]
+
+def build_vocabulary(sentences):
+    vocab = set()
+    for sent in sentences:
+        words = re.findall(r'[а-яА-ЯёЁa-zA-Z]+', sent.lower())
+        vocab.update(words)
+    return sorted(vocab)
+
+def sentence_vector(sent, vocab):
+    words = set(re.findall(r'[а-яА-ЯёЁa-zA-Z]+', sent.lower()))
+    return [1 if w in words else 0 for w in vocab]
+
+def cosine_similarity(vec1, vec2):
+    dot = sum(a*b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a*a for a in vec1))
+    norm2 = math.sqrt(sum(b*b for b in vec2))
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+def texttiling_segmentation(text, window_size=3, threshold_ratio=0.7):
+    sentences = get_sentences(text)
+    if len(sentences) < 4:
+        return [' '.join(sentences)] if sentences else []
+    vocab = build_vocabulary(sentences)
+    vectors = [sentence_vector(s, vocab) for s in sentences]
+    similarities = []
+    for i in range(len(vectors) - 1):
+        sim = cosine_similarity(vectors[i], vectors[i+1])
+        similarities.append(sim)
+    if not similarities:
+        return [' '.join(sentences)]
+    window = window_size
+    smoothed = []
+    for i in range(len(similarities)):
+        start = max(0, i - window//2)
+        end = min(len(similarities), i + window//2 + 1)
+        avg = sum(similarities[start:end]) / (end - start) if end > start else 0
+        smoothed.append(avg)
+    mean_sim = statistics.mean(smoothed) if smoothed else 0
+    threshold = mean_sim * threshold_ratio
+    boundaries = []
+    for i in range(1, len(smoothed) - 1):
+        if smoothed[i] < smoothed[i-1] and smoothed[i] < smoothed[i+1] and smoothed[i] < threshold:
+            boundaries.append(i + 1)
+    merged_boundaries = []
+    for b in boundaries:
+        if not merged_boundaries or b - merged_boundaries[-1] > 3:
+            merged_boundaries.append(b)
+        else:
+            merged_boundaries[-1] = (merged_boundaries[-1] + b) // 2
+    blocks = []
+    start = 0
+    for b in merged_boundaries:
+        if b > start:
+            block_sentences = sentences[start:b]
+            blocks.append(' '.join(block_sentences))
+            start = b
+    if start < len(sentences):
+        blocks.append(' '.join(sentences[start:]))
+    if len(blocks) < 2:
+        return [' '.join(sentences)]
+    filtered = []
+    for b in blocks:
+        word_cnt = len(re.findall(r'[а-яА-ЯёЁa-zA-Z]+', b))
+        if word_cnt >= 20 and len(get_sentences(b)) >= 2:
+            filtered.append(b)
+    return filtered if filtered else [' '.join(sentences)]
+
+def count_sentences(text):
+    sentences = re.split(r'[.!?]+', text)
+    return len([s for s in sentences if s.strip()])
+
+def count_words(text):
+    return len(re.findall(r'[а-яА-ЯёЁa-zA-Z]+', text))
+
+def count_syllables(word):
+    vowels = 'аеёиоуыэюяaeiouy'
+    return len(re.findall(f'[{vowels}]+', word, re.IGNORECASE))
+
+def flesch_reading_ease(text):
+    sentences = re.split(r'[.!?]+', text.strip())
+    sentences = [s for s in sentences if s.strip()]
+    if not sentences:
+        return 0.0
+    words = re.findall(r'[а-яА-ЯёЁa-zA-Z]+', text)
+    if not words:
+        return 0.0
+    avg_words = len(words) / len(sentences)
+    total_syll = sum(count_syllables(w) for w in words)
+    avg_syll = total_syll / len(words)
+    score = 206.835 - 1.3 * avg_words - 60.1 * avg_syll
+    return max(0.0, min(100.0, score))
+
+def sentence_length_stats(text):
+    sentences = re.split(r'[.!?]+', text.strip())
+    word_counts = [len(re.findall(r'[а-яА-ЯёЁa-zA-Z]+', s)) for s in sentences if s.strip()]
+    if not word_counts:
+        return {'avg': 0, 'min': 0, 'max': 0, 'std': 0}
+    avg = sum(word_counts) / len(word_counts)
+    min_len = min(word_counts)
+    max_len = max(word_counts)
+    if len(word_counts) > 1:
+        variance = sum((x - avg) ** 2 for x in word_counts) / len(word_counts)
+        std = math.sqrt(variance)
+    else:
+        std = 0.0
+    return {'avg': avg, 'min': min_len, 'max': max_len, 'std': std}
+
+def split_into_parts(text, intro_ratio=0.15, concl_ratio=0.10):
+    sentences = re.split(r'[.!?]+', text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+    total = len(sentences)
+    if total < 3:
+        return {'intro': '', 'body': text, 'conclusion': ''}
+    intro_cnt = max(1, int(total * intro_ratio))
+    concl_cnt = max(1, int(total * concl_ratio))
+    if intro_cnt + concl_cnt > total:
+        intro_cnt = max(1, total - concl_cnt - 1)
+        concl_cnt = max(1, total - intro_cnt - 1)
+    intro = ' '.join(sentences[:intro_cnt])
+    body = ' '.join(sentences[intro_cnt:-concl_cnt]) if intro_cnt + concl_cnt < total else ''
+    conclusion = ' '.join(sentences[-concl_cnt:])
+    return {'intro': intro, 'body': body, 'conclusion': conclusion}
+
+def extract_features(text):
+    features = {}
+    features['word_count'] = count_words(text)
+    features['sentence_count'] = count_sentences(text)
+    sent_stats = sentence_length_stats(text)
+    features['sent_avg'] = sent_stats['avg']
+    features['sent_min'] = sent_stats['min']
+    features['sent_max'] = sent_stats['max']
+    features['sent_std'] = sent_stats['std']
+    features['flesch'] = flesch_reading_ease(text)
+    parts = split_into_parts(text)
+    for part_name, part_text in parts.items():
+        features[f'{part_name}_words'] = count_words(part_text) if part_text else 0
+        features[f'{part_name}_sentences'] = count_sentences(part_text) if part_text else 0
+    features['digit_count'] = len(re.findall(r'\d+', text))
+    return features
+
+def word_order_stats_with_spacy(text, nlp):
+    if nlp is None:
+        return None
+    doc = nlp(text)
+    total = 0
+    direct = 0
+    for sent in doc.sents:
+        root = None
+        subj = None
+        obj = None
+        for token in sent:
+            if token.dep_ == 'ROOT':
+                root = token
+            if token.dep_ in ('nsubj', 'nsubj:pass'):
+                subj = token
+            if token.dep_ in ('obj', 'dobj'):
+                obj = token
+        if root and subj and obj:
+            total += 1
+            if subj.i < root.i < obj.i:
+                direct += 1
+    if total == 0:
+        return {'analyzed_sentences': 0, 'direct_ratio': 0.0, 'inversion_ratio': 0.0}
+    return {
+        'analyzed_sentences': total,
+        'direct_ratio': direct / total,
+        'inversion_ratio': 1.0 - direct / total
+    }
+
+def process_all_docs(folder_path, output_csv, nlp=None):
+    all_features = []
+    if not os.path.isdir(folder_path):
+        print(f"Ошибка: папка '{folder_path}' не найдена.")
+        return all_features
+    txt_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.txt')]
+    if not txt_files:
+        print(f"В папке '{folder_path}' нет текстовых файлов.")
+        return all_features
+    print(f"Найдено {len(txt_files)} файлов. Выполняется автоматическая сегментация по темам...")
+    for filename in txt_files:
+        filepath = os.path.join(folder_path, filename)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            try:
+                with open(filepath, 'r', encoding='cp1251') as f:
+                    content = f.read()
+            except Exception as e:
+                print(f"Не удалось прочитать {filename}: {e}")
+                continue
+        except Exception as e:
+            print(f"Ошибка чтения {filename}: {e}")
+            continue
+        news_blocks = texttiling_segmentation(content, window_size=3, threshold_ratio=0.7)
+        print(f"Файл '{filename}': выделено {len(news_blocks)} тематических блоков.")
+        for block in news_blocks:
+            if len(block) < 20:
+                continue
+            feat = extract_features(block)
+            feat['source_file'] = filename
+            if nlp is not None:
+                order = word_order_stats_with_spacy(block, nlp)
+                if order:
+                    feat['order_analyzed'] = order['analyzed_sentences']
+                    feat['order_direct_ratio'] = order['direct_ratio']
+                    feat['order_inversion_ratio'] = order['inversion_ratio']
+            all_features.append(feat)
+    if all_features:
+        fieldnames = all_features[0].keys()
+        with open(output_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_features)
+        print(f"Признаки сохранены в '{output_csv}' (всего {len(all_features)} новостей).")
+    else:
+        print("Не удалось извлечь признаки.")
+    return all_features
+
+def generate_prompt(features_list):
+    if not features_list:
+        return "Нет данных для анализа."
+    word_counts = [f['word_count'] for f in features_list]
+    sent_counts = [f['sentence_count'] for f in features_list]
+    flesch_scores = [f['flesch'] for f in features_list if f['flesch'] > 0]
+    sent_avgs = [f['sent_avg'] for f in features_list if f['sent_avg'] > 0]
+    sent_mins = [f['sent_min'] for f in features_list]
+    sent_maxs = [f['sent_max'] for f in features_list]
+    intro_w = [f.get('intro_words', 0) for f in features_list]
+    body_w = [f.get('body_words', 0) for f in features_list]
+    concl_w = [f.get('conclusion_words', 0) for f in features_list]
+    avg_word_count = statistics.mean(word_counts) if word_counts else 0
+    avg_sent_count = statistics.mean(sent_counts) if sent_counts else 0
+    avg_flesch = statistics.mean(flesch_scores) if flesch_scores else 0
+    avg_sent_len = statistics.mean(sent_avgs) if sent_avgs else 0
+    min_sent_len = min(sent_mins) if sent_mins else 0
+    max_sent_len = max(sent_maxs) if sent_maxs else 0
+    avg_intro = statistics.mean(intro_w) if intro_w else 0
+    avg_body = statistics.mean(body_w) if body_w else 0
+    avg_concl = statistics.mean(concl_w) if concl_w else 0
+    total_avg = avg_intro + avg_body + avg_concl
+    intro_perc = (avg_intro / total_avg * 100) if total_avg else 15
+    body_perc = (avg_body / total_avg * 100) if total_avg else 75
+    concl_perc = (avg_concl / total_avg * 100) if total_avg else 10
+    direct_ratios = [f['order_direct_ratio'] for f in features_list if 'order_direct_ratio' in f and f.get('order_analyzed', 0) > 0]
+    avg_direct = statistics.mean(direct_ratios) if direct_ratios else None
+    prompt_parts = []
+    prompt_parts.append("Ты — профессиональный журналист, пишущий новостные сюжеты в стиле проанализированных источников.")
+    prompt_parts.append("")
+    prompt_parts.append(f"Твои тексты должны соответствовать следующим параметрам (получены на основе анализа {len(features_list)} новостей):")
+    prompt_parts.append("")
+    prompt_parts.append("1. Структура новости:")
+    prompt_parts.append(f"   - Вступление: примерно {intro_perc:.0f}% текста (в среднем {avg_intro:.1f} слов), содержит основную суть события.")
+    prompt_parts.append(f"   - Основная часть: {body_perc:.0f}% текста (в среднем {avg_body:.1f} слов), раскрывает детали, факты, цитаты.")
+    prompt_parts.append(f"   - Заключение: {concl_perc:.0f}% текста (в среднем {avg_concl:.1f} слов), подводит итог или упоминает последствия.")
+    prompt_parts.append("")
+    prompt_parts.append("2. Длина и сложность предложений:")
+    prompt_parts.append(f"   - Средняя длина предложения: {avg_sent_len:.1f} слов (от {min_sent_len:.0f} до {max_sent_len:.0f} слов).")
+    prompt_parts.append(f"   - Среднее количество предложений в новости: {avg_sent_count:.1f}.")
+    prompt_parts.append(f"   - Среднее количество слов в новости: {avg_word_count:.1f}.")
+    prompt_parts.append("   - Предложения должны быть преимущественно простыми или сложносочинёнными, избегай излишней вложенности.")
+    prompt_parts.append("")
+    prompt_parts.append("3. Удобочитаемость (индекс Флеша для русского языка):")
+    prompt_parts.append(f"   - Среднее значение: {avg_flesch:.1f} (диапазон 0–100, чем выше – тем легче). Это соответствует стилю информационных новостей.")
+    prompt_parts.append("")
+    if avg_direct is not None:
+        prompt_parts.append("4. Порядок слов в предложении:")
+        if avg_direct > 0.6:
+            prompt_parts.append(f"   - Преобладает прямой порядок (подлежащее–сказуемое–дополнение) – {avg_direct*100:.0f}% случаев.")
+        else:
+            prompt_parts.append(f"   - Смешанный порядок слов, часто используются инверсии (доля прямого порядка – {avg_direct*100:.0f}%).")
+        prompt_parts.append("   - Инверсии допустимы для выделения обстоятельств времени или места в начале предложения.")
+        prompt_parts.append("")
+    else:
+        prompt_parts.append("4. Порядок слов: не анализировался (установите spaCy для более точных рекомендаций).")
+        prompt_parts.append("")
+    prompt_parts.append("5. Лексика и стиль:")
+    prompt_parts.append("   - Используй активные глаголы, избегай пассивных конструкций.")
+    prompt_parts.append("   - Употребляй конкретные числительные, названия организаций и географические названия.")
+    prompt_parts.append("   - Избегай канцеляризмов и длинных цепочек родительных падежей.")
+    prompt_parts.append("   - Придерживайся нейтрального, информационного тона.")
+    prompt_parts.append("")
+    prompt_parts.append("---")
+    prompt_parts.append("Напиши новость на заданную тему, постарайся соблюдать все перечисленные параметры. Текст должен быть связным, логичным и соответствовать стилю новостного эфира.")
+    return "\n".join(prompt_parts)
+
+def analyze_transcripts():
+    nlp = None
+    try:
+        import spacy
+        nlp = spacy.load('ru_core_news_sm')
+        print("Модель spaCy загружена.")
+    except ImportError:
+        print("spaCy не установлена. Анализ порядка слов пропущен.")
+    except OSError:
+        print("Модель ru_core_news_sm не найдена. Анализ порядка слов пропущен.")
+    features = process_all_docs(TRANSCRIBED_FOLDER, ANALYSIS_OUTPUT_CSV, nlp=nlp)
+    if features:
+        prompt = generate_prompt(features)
+        with open(PROMPT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            f.write(prompt)
+        print(f"\nПромпт сохранён в '{PROMPT_OUTPUT_FILE}'.")
+        print("\n=== Сгенерированный промпт ===\n")
+        print(prompt)
+    else:
+        print("Не найдено новостей для анализа.")
+
+
+# основной запуск
+def main():
+    print("=" * 60)
+    print("ШАГ 1: Скачивание аудио из Telegram")
+    print("=" * 60)
+    asyncio.run(download_audio_from_telegram())
+    print("\n" + "=" * 60)
+    print("ШАГ 2: Обработка аудио (вырезание новостных блоков)")
+    print("=" * 60)
+    process_audio_files()
+    print("\n" + "=" * 60)
+    print("ШАГ 3: Распознавание речи (Whisper)")
+    print("=" * 60)
+    transcribe_audio_files()
+    print("\n" + "=" * 60)
+    print("ШАГ 4: Анализ текстов и генерация промпта")
+    print("=" * 60)
+    analyze_transcripts()
+    print("\n" + "=" * 60)
+    print("ВСЕ ЭТАПЫ ЗАВЕРШЕНЫ!")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
