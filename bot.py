@@ -150,6 +150,50 @@ def parse_duration_input(text: str) -> int | None:
         return None
     return seconds
 
+def find_sentence_end(text: str, max_words: int) -> str:
+    """Находит конец последнего полного предложения в пределах max_words слов"""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    
+    truncated = " ".join(words[:max_words])
+    
+    # Ищем последнюю точку, вопросительный или восклицательный знак
+    last_punct = max(
+        truncated.rfind('. '),
+        truncated.rfind('? '),
+        truncated.rfind('! '),
+        truncated.rfind('.'),
+        truncated.rfind('?'),
+        truncated.rfind('!')
+    )
+    
+    if last_punct > 0:
+        # Проверяем, что это не точка в числе или сокращении
+        if last_punct < len(truncated) - 1:
+            next_char = truncated[last_punct + 1]
+            if next_char == ' ' or next_char == '':
+                return truncated[:last_punct + 1]
+            else:
+                # Может быть точка в числе или сокращении
+                # Ищем следующий знак препинания с пробелом
+                last_punct_with_space = max(
+                    truncated.rfind('. '),
+                    truncated.rfind('? '),
+                    truncated.rfind('! ')
+                )
+                if last_punct_with_space > 0:
+                    return truncated[:last_punct_with_space + 1]
+    
+    # Если нет знаков препинания, ищем по заглавным буквам (начало нового предложения)
+    words_trunc = truncated.split()
+    for i in range(len(words_trunc) - 1, 0, -1):
+        if len(words_trunc[i]) > 0 and words_trunc[i][0].isupper():
+            return " ".join(words_trunc[:i])
+    
+    # Если ничего не нашли, возвращаем как есть
+    return truncated
+
 # промпты для YandexGPT 
 BASE_PROMPT = """
 Ты — профессиональный журналист, пишущий новостные сюжеты в стиле проанализированных источников.
@@ -259,7 +303,7 @@ async def get_yandexgpt_response(user_text: str, system_prompt: str, max_words: 
         return answer
 
     if actual_words > max_words:
-        instruction = f"Сократи до {max_words} слов (сейчас {actual_words}). Удали второстепенные детали, оставь суть."
+        instruction = f"Сократи до {max_words} слов (сейчас {actual_words}). Удали второстепенные детали, оставь суть. Важно: не обрывай предложения на середине, каждое предложение должно быть законченным."
     else:
         instruction = f"Увеличь объём до {max_words} слов (сейчас {actual_words}). Добавь недостающие детали из исходного текста, но сохрани стиль и правила."
 
@@ -274,25 +318,48 @@ async def get_yandexgpt_response(user_text: str, system_prompt: str, max_words: 
         {"role": "user", "content": f"Исходный текст для адаптации:\n{user_text}\n\n{retry_prompt}"}
     ])
     if answer2 is None:
-        return f"Не удалось исправить объём. Вот предыдущий ответ (на свой страх и риск):\n\n{answer}"
+        return answer
 
     actual2 = count_words(answer2)
     if min_words <= actual2 <= max_words:
         return answer2
 
+    # Если текст всё ещё слишком длинный, просим модель сократить, сохраняя целостность предложений
     if actual2 > max_words:
-        words = answer2.split()
-        truncated = " ".join(words[:max_words])
-        return truncated + "… (принудительное сокращение)"
-    else:
+        retry_prompt_2 = (
+            f"Текст содержит {actual2} слов, а нужно не более {max_words} слов. "
+            "Сократи текст, удаляя второстепенные детали, но сохрани все предложения целыми - не обрывай их на середине. "
+            "Каждое предложение должно быть законченным. Ответь только сокращённым текстом."
+        )
         answer3 = await _make_request([
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Текст слишком короткий ({actual2} слов, нужно {max_words}). Допиши недостающие детали из исходника, сохраняя стиль. Ответь только дополненным текстом:\n{answer2}"}
+            {"role": "user", "content": f"Исходный текст для адаптации:\n{user_text}\n\n{retry_prompt_2}"}
+        ])
+        if answer3 is not None:
+            actual3 = count_words(answer3)
+            if actual3 <= max_words:
+                return answer3
+            # Если модель не справилась, пробуем найти конец последнего предложения
+            truncated = find_sentence_end(answer3, max_words)
+            if count_words(truncated) <= max_words:
+                return truncated
+            return answer3
+        else:
+            # Если не удалось получить ответ, пробуем обрезать оригинал
+            truncated = find_sentence_end(answer2, max_words)
+            if count_words(truncated) <= max_words:
+                return truncated
+            return answer2
+    else:
+        # Текст слишком короткий
+        answer3 = await _make_request([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Текст слишком короткий ({actual2} слов, нужно до {max_words}). Допиши недостающие детали из исходника, сохраняя стиль. Ответь только дополненным текстом:"}
         ])
         if answer3 and count_words(answer3) <= max_words:
             return answer3
         else:
-            return answer2 + " (текст слишком короткий, но это лучший вариант)"
+            return answer2
 
 # расстановка ударений
 async def put_stresses(text: str) -> str:
